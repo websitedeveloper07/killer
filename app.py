@@ -15,11 +15,6 @@ ALLOWED_KEY = "rockybest"
 SITES: List[str] = [
     "https://deltacloudz.com",
     "https://therapyessentials.coraphysicaltherapy.com",
-    "https://bacteriostaticwater.com",
-    "https://livelovespa.com",
-    "https://divinebovinejerky.com",
-    "https://casabelladecor.net",
-    "https://lptmedical.com",
     "https://restart.brooksrunning.com",
     "https://safeandsoundhq.com",
     "https://urbanspaceinteriors.com"
