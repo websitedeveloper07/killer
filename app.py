@@ -25,7 +25,7 @@ SITES: List[str] = [
 
 REMOTE_API_TEMPLATE = "https://rockyysoon-fb0f.onrender.com/index.php?site={site}&cc={cc}"
 
-MAX_CONCURRENT = 1          # Run 2-3 sites in parallel
+MAX_CONCURRENT = 3          # Run 2-3 sites in parallel
 REQUEST_TIMEOUT = 40        # seconds per request
 CONNECT_TIMEOUT = 25        # seconds for connection
 # ---------------------------------------
